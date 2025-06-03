@@ -45,190 +45,161 @@ PREPARATION_TIME = 3  # Seconds before the game starts moving notes
 class GameNote:
     def __init__(self, lane, note_type, hit_time, end_time=None):
         self.lane = lane
-        self.note_type = note_type  # TAP_NOTE or HOLD_NOTE_BODY
-        self.hit_time = hit_time  # Target time for the head of the note
-        self.end_time = end_time  # Target time for the tail of a hold note
+        self.note_type = note_type
+        self.hit_time = hit_time
+        self.end_time = end_time
 
-        # Visual length
+        # Visual
         if note_type == TAP_NOTE:
             self._length = 12
         else:  # HOLD_NOTE_BODY
             self._length = int((end_time - hit_time) * NOTE_SPEED)
+        self.padding = 2
 
         self.canvas: Optional[GameCanvas] = None
         self.canvas_item_id = None
-        self._time_at_last_visual_update = 0.0  # For visual movement interpolation
+        self._time_at_last_visual_update = 0.0
 
-        # --- Judgement & State ---
-        self.is_judged = False  # True if any final judgement (hit or miss) has been made
+        self.is_judged = False  # is hit or missed
         self.judgement_result: Optional[str] = None
 
         # For Hold Notes
-        self.head_hit_error: Optional[float] = None  # For hold notes, abs error of head press
-        self.tail_release_error: Optional[float] = None  # For hold notes, abs error of tail release
-        self.is_holding = False  # Is the key currently considered pressed for this active hold note
-        self.is_head_hit_successfully = False  # Was the head of the hold note hit within any valid window (not a miss)
-        self.broken_hold = False  # Was the key released prematurely during the hold
+        self.head_hit_error: Optional[float] = None
+        self.tail_release_error: Optional[float] = None
+        self.is_holding = False
+        self.is_head_hit_successfully = False
+        self.broken_hold = False
 
-    def get_x_coords(self):
-        # ... (no change from your code)
-        lane_width = self.canvas.lane_width
-        x1 = self.lane * lane_width
-        x2 = x1 + lane_width
-        return x1, x2
+    def get_x_coords(self) -> Optional[tuple[float, float]]:
+        if self.canvas is not None and (lane_width := self.canvas.lane_width) is not None:
+            x1 = self.lane * lane_width
+            x2 = x1 + lane_width
+            return x1 + self.padding, x2 - self.padding
 
-    def get_y_coords(self, game_time):
-        if self.canvas is not None and self.canvas.judgment_line_y is not None:
-            y2 = int((game_time - self.hit_time) * NOTE_SPEED + self.canvas.judgment_line_y)
+    def get_y_coords(self, game_time: float) -> Optional[tuple[float, float]]:
+        if self.canvas is not None and (y_offset := self.canvas.judgment_line_y) is not None:
+            y2 = int((game_time - self.hit_time) * NOTE_SPEED + y_offset)
             y1 = y2 - self._length
             return y1, y2
-        raise ValueError("Canvas or judgment line Y position is not set.")
 
-    def out_of_visual_range(self, game_time) -> int:
-        if not self.canvas:
-            return 1  # No canvas, effectively off-screen
-        y1, y2 = self.get_y_coords(game_time)
-        # -1: above screen, 0: on screen, 1: below screen (top edge passed bottom)
-        if y2 < 0:
-            return -1  # Entirely above
-        if y1 > self.canvas.winfo_height():
-            return 1  # Entirely below
-        return 0  # On screen or partially on screen
+    def _get_padded_drawing_bounds(self, game_time: float) -> Optional[tuple[float, float, float, float]]:
+        """
+        Helper to get the actual drawing coordinates including padding.
+        Returns (x1_padded, y1_note, x2_padded, y2_note) or None if canvas isn't set.
+        """
+        if lane_x := self.get_x_coords():
+            lane_x1, lane_x2 = lane_x
+        else:
+            return
+        if note_y := self.get_y_coords(game_time):  # else return None if fail
+            note_y1, note_y2 = note_y
+            return lane_x1, note_y1, lane_x2, note_y2
 
     def draw_on_canvas(self, game_time: float):
         """
-        Creates the canvas item for the note if it's visually in range and doesn't exist.
-        Assumes self.canvas is already set.
+        Creates the canvas item if it's time for it to be visible and it hasn't been drawn/judged.
+        Assumes self.canvas has been set by ManiaGame.
         """
-        if self.is_judged:
-            self.remove_from_canvas()  # Clean up if judged or canvas gone
+        if self.is_judged or self.canvas_item_id or not self.canvas:
+            return  # Already judged, already drawn, or no canvas
+
+        if bounds := self._get_padded_drawing_bounds(game_time):
+            x1_pad, y1_draw, x2_pad, y2_draw = bounds
+        else:
             return
+        canvas_height = self.canvas.winfo_height()
 
-        # 1. Check if canvas is set
-        # 2. This method is for initial creation. If item_id exists, update_visual_position handles it.
-        # 3. Only create if it's currently in visual range
+        # Condition for initial drawing: if any part of the note is within screen bounds
+        is_vertically_visible = (y2_draw > 0 and y1_draw < canvas_height)
 
-        if not self.canvas or self.canvas_item_id is not None or self.out_of_visual_range(game_time) != 0:
-            return
-
-        self._time_at_last_visual_update = game_time  # Set time reference for first positioning
-        x1, x2 = self.get_x_coords()
-        padding = 2
-        x1_pad, x2_pad = x1 + padding, x2 - padding
-        y1_draw, y2_draw = self.get_y_coords(game_time)  # Get current coordinates for drawing
-        color = TAP_NOTE_COLOR if self.note_type == TAP_NOTE else HOLD_NOTE_COLOR
-
-        self.canvas_item_id = self.canvas.create_rectangle(
-            x1_pad, y1_draw, x2_pad, y2_draw,
-            fill=color, outline=color, tags="note", state='normal'
-        )
+        if is_vertically_visible:
+            self._time_at_last_visual_update = game_time  # Anchor time for first draw
+            color = TAP_NOTE_COLOR if self.note_type == TAP_NOTE else HOLD_NOTE_COLOR
+            self.canvas_item_id = self.canvas.create_rectangle(
+                x1_pad, y1_draw, x2_pad, y2_draw,
+                fill=color, outline=color, tags="note"
+            )
 
     def update_visual_position(self, game_time: float):
         """
-        Moves an existing canvas item and handles its visibility (hide/show)
-        if it moves off/on screen.
+        Moves an existing canvas item. If it moves completely off-screen (bottom),
+        its canvas item is deleted. The note object itself persists for time-based judgment.
         """
-        if self.is_judged:
-            self.remove_from_canvas()
+        if self.is_judged or not self.canvas_item_id or not self.canvas or not self.canvas.winfo_exists():
+            # If judged, remove_from_canvas would be called by the judging method.
+            # If no canvas_item_id, nothing to move.
             return
-        if not self.canvas or not self.canvas_item_id:
-            return
-
-        current_visual_status = self.out_of_visual_range(game_time)
-
-        try:
-            current_item_state = self.canvas.itemcget(self.canvas_item_id, 'state')
-        except tk.TclError:  # Item might have been deleted externally or canvas closed
-            self.canvas_item_id = None
-            return
-
-        if current_visual_status != 0:  # Note is visually off-screen (entirely above or below)
-            if current_item_state == 'normal':
-                self.canvas.itemconfig(self.canvas_item_id, state='hidden')
-            # Even if hidden, keep its logical time reference somewhat updated if needed for y_coords,
-            # though y_coords should primarily be driven by game_time vs hit_time.
-            # self._time_at_last_visual_update = game_time # This might lead to large jumps if it reappears.
-            # Better to let draw_on_canvas reset it when it becomes visible.
-            return  # Don't attempt to move if hidden and determined to be off-screen
-        else:  # Note is visually on-screen
-            if current_item_state == 'hidden':
-                self.canvas.itemconfig(self.canvas_item_id, state='normal')
-                # When note becomes visible again, reset its drawing position and time anchor
-                self._time_at_last_visual_update = game_time
-                x1, x2 = self.get_x_coords()
-                padding = 2
-                x1_pad, x2_pad = x1 + padding, x2 - padding
-                y1_draw, y2_draw = self.get_y_coords(game_time)
-                self.canvas.coords(self.canvas_item_id, x1_pad, y1_draw, x2_pad, y2_draw)
-                # No further movement needed in this tick if we just re-drew it / made it visible at current pos
-
-        # Calculate movement based on time delta since last *visual* update when it *was* visible
-        time_elapsed = game_time - self._time_at_last_visual_update
-        pixel_movement = time_elapsed * NOTE_SPEED
-
-        if abs(pixel_movement) >= 0.1:  # Threshold to apply move; can be 0 for max precision
-            self.canvas.move(self.canvas_item_id, 0, pixel_movement)
-            self._time_at_last_visual_update = game_time
-
-    def update_visual_position(self, game_time):
-        if self.is_judged or not self.canvas_item_id:
-            self.remove_from_canvas()
-            return
-
-        if self.out_of_visual_range(game_time) != 0:
-            if self.canvas.itemcget(self.canvas_item_id, 'state') == 'normal':
-                self.canvas.itemconfig(self.canvas_item_id, state='hidden')
-            self._time_at_last_visual_update = game_time  # Keep this updated even if hidden
-            return
-        else:  # Is visually on screen
-            if self.canvas.itemcget(self.canvas_item_id, 'state') == 'hidden':
-                self.canvas.itemconfig(self.canvas_item_id, state='normal')
 
         time_elapsed = game_time - self._time_at_last_visual_update
         pixel_movement = time_elapsed * NOTE_SPEED
 
-        if abs(pixel_movement) >= 1:  # Threshold to move
+        if abs(pixel_movement) >= 0.1:  # Apply movement if significant
             self.canvas.move(self.canvas_item_id, 0, pixel_movement)
             self._time_at_last_visual_update = game_time
 
-    def _finalize_judgement(self, judgement: str):
+        # Check if the note's top edge has scrolled past the bottom of the canvas AFTER moving
+        current_coords = self.canvas.coords(self.canvas_item_id)
+        note_top_y_on_canvas = current_coords[1]
+        canvas_height = self.canvas.winfo_height()
+
+        if note_top_y_on_canvas > canvas_height:
+            # Note is completely off-screen (bottom). Delete its visual representation.
+            # The note object remains in active_notes for potential time-based miss judgment.
+            self.remove_from_canvas()
+
+    def remove_from_canvas(self):
+        """Safely removes the note's item from the canvas."""
+        if self.canvas and self.canvas_item_id and self.canvas.winfo_exists():
+            try:
+                # Check if item actually exists on canvas before deleting
+                if self.canvas.find_withtag(self.canvas_item_id):  # More robust check
+                    self.canvas.delete(self.canvas_item_id)
+            except tk.TclError:
+                pass  # Item or canvas might be gone
+            finally:
+                self.canvas_item_id = None
+
+    # _finalize_judgement, judge_tap_hit, judge_hold_head_hit, etc.
+    # These methods should call self.remove_from_canvas() when a note is definitively judged.
+    def _finalize_judgement(self, judgement: str):  # Make sure this is called by all judging paths
+        if self.is_judged: return  # Avoid double judgement
         self.is_judged = True
         self.judgement_result = judgement
         print(f"Lane {self.lane} ({self.note_type}): {self.judgement_result}! (Hit: {self.hit_time:.3f}" +
               (f", End: {self.end_time:.3f}" if self.end_time else "") + ")")
-        self.remove_from_canvas()
+        self.remove_from_canvas()  # Crucial: remove visual when judged
 
+    # Ensure judge_as_miss also calls _finalize_judgement or directly remove_from_canvas
+    def judge_as_miss(self):
+        if self.is_judged: return
+        # self.is_missed = True # This was from previous structure, now covered by is_judged + judgement_result
+        # self.is_hit = True    # "
+        # self.judgement_result = "Miss"
+        # print(f"Lane {self.lane}: MISS! (Time: {self.hit_time:.3f})")
+        # self.remove_from_canvas()
+        self._finalize_judgement("Miss")
+
+    # Other judgement methods (judge_tap_hit, judge_hold_head_hit, judge_hold_complete)
+    # should ultimately lead to _finalize_judgement or set self.is_judged and call remove_from_canvas.
+    # For example:
     def judge_tap_hit(self, judgement: str):
         if self.is_judged: return
         self._finalize_judgement(judgement)
 
     def judge_hold_head_hit(self, head_error_abs: float, head_judgement: str):
-        if self.is_judged: return
+        if self.is_judged or self.is_head_hit_successfully:
+            return  # Don't re-process head
         self.head_hit_error = head_error_abs
-        self.is_head_hit_successfully = head_judgement != "Miss"  # Assuming Miss is passed if head is missed
-        self.is_holding = self.is_head_hit_successfully  # Start holding only if head was a success
-        # Don't call _finalize_judgement here, wait for release or miss
+        self.is_head_hit_successfully = head_judgement != "Miss"
+        self.is_holding = self.is_head_hit_successfully
+        # Do NOT finalize judgement here for holds.
         print(f"Lane {self.lane} (HOLD HEAD): {head_judgement}! Error: {head_error_abs:.3f}s")
-        # Visual feedback for head hit could be added here (e.g., change color of the note slightly)
+        if head_judgement == "Miss":  # If head is missed, the whole hold is missed
+            self._finalize_judgement("Miss")
 
     def judge_hold_complete(self, final_judgement: str):
         if self.is_judged: return
         self._finalize_judgement(final_judgement)
-
-    def judge_as_miss(self):
-        if self.is_judged: return
-        self._finalize_judgement("Miss")
-        # If it's a hold note and the head was missed, specific logic for hold miss might be needed too.
-
-    def remove_from_canvas(self):
-        if self.canvas and self.canvas_item_id:
-            try:
-                if self.canvas.winfo_exists():  # Check if canvas still exists
-                    self.canvas.delete(self.canvas_item_id)
-            except tk.TclError:  # Widget might be destroyed
-                pass
-            finally:
-                self.canvas_item_id = None
 
 
 class GameCanvas(tk.Canvas):
@@ -556,87 +527,74 @@ class ManiaGame(AsyncTkHelper):
         note.judge_hold_complete(final_judgement)
         self._display_judgement_text(note.judgement_result, note.lane)
 
-    # In ManiaGame class:
-
     def update_notes(self, game_time: float):
-        # 1. Activate pending notes: Move from pending_notes to active_notes
-        #    Notes are activated if their hit_time is approaching.
+        # 1. Activate pending notes:
+        #    Notes are moved from pending_notes to active_notes if their hit_time is approaching.
         while self.pending_notes:
-            # Peek at the note that would be processed next (earliest hit_time, at end of list for pop)
-            note_to_consider_activating = self.pending_notes[-1]
-
-            if note_to_consider_activating.hit_time <= game_time + self.NOTE_ACTIVATION_LEAD_TIME_S:
-                # This note's showtime is approaching. Activate it.
+            if self.pending_notes[-1].hit_time <= game_time + self.NOTE_ACTIVATION_LEAD_TIME_S:
                 note = self.pending_notes.pop()
-
-                # IMPORTANT: Set canvas reference on the note object.
-                note.canvas = self.canvas
-
+                note.canvas = self.canvas # Set canvas reference immediately
                 self.active_notes.append(note)
             else:
-                # The earliest pending note is still too far in the future. Stop checking.
-                break
+                break  # Earliest pending note is still too far in the future.
 
-        # 2. Update active notes: visuals, auto-misses, hold logic
-        for note in list(self.active_notes):  # Iterate over a copy if a note might be removed from active_notes
+        # 2. Update active notes (drawing, movement, judgment logic):
+        for note in list(self.active_notes):  # Iterate over a copy for safe removal if needed by other logic
             if note.is_judged:
-                # If judged, it should have called remove_from_canvas itself.
-                # No further processing needed for this note.
-                continue
+                continue  # Already judged and handled (its visual should be gone)
 
-            # Ensure canvas is set (should be if it came from pending_notes processing above)
-            if not note.canvas:
-                note.canvas = self.canvas
-
-            # A. Handle drawing and visual updates:
-            if not note.canvas_item_id:
-                # Note is active but not yet on canvas (e.g., just activated). Try to draw it.
-                # draw_on_canvas will create the item if it's visually in range.
-                # It also sets _time_at_last_visual_update upon successful drawing.
+            # A. Drawing: If note is active but not yet on canvas, try to draw it.
+            if note.canvas_item_id is None:
+                # note.draw_on_canvas() will internally check if it's currently in visual range
+                # and create the canvas item if so.
                 note.draw_on_canvas(game_time)
 
+            # B. Movement: If it's drawn on canvas, update its position.
             if note.canvas_item_id:
-                # If it has a canvas item (either just created or existed), update its position.
-                # update_visual_position handles movement and hiding/showing if it goes off edges.
                 note.update_visual_position(game_time)
+                # note.update_visual_position() might set note.canvas_item_id to None
+                # if it scrolls completely off-screen. The note object itself remains active
+                # for time-based miss judgment.
 
-            # B. Auto-Miss Logic for Tap Notes and Hold Note Heads (if still not judged by player)
-            if not note.is_judged:  # Double-check, as it might have been judged by player input between game ticks
-                is_head_miss_candidate = (note.note_type == TAP_NOTE) or \
-                                         (note.note_type == HOLD_NOTE_BODY and not note.is_head_hit_successfully)
+            # C. Auto-Miss Logic (Tap Notes and Hold Note Heads)
+            # This runs regardless of current canvas_item_id status, as a fast note might
+            # scroll off (canvas_item_id becomes None) before its auto-miss time.
+            is_head_miss_candidate = (note.note_type == TAP_NOTE) or \
+                                     (note.note_type == HOLD_NOTE_BODY and not note.is_head_hit_successfully)
 
-                if is_head_miss_candidate:
-                    if game_time > note.hit_time + self.auto_miss_if_unhit_offset_s:  # Past OK window for head
-                        note.judge_as_miss()  # This method also calls remove_from_canvas
-                        self._display_judgement_text("Miss", note.lane)
-                        continue  # Done with this note
+            if is_head_miss_candidate:
+                if game_time > note.hit_time + self.auto_miss_if_unhit_offset_s:
+                    note.judge_as_miss()  # This now calls _finalize_judgement, which calls remove_from_canvas
+                    self._display_judgement_text("Miss", note.lane)
+                    continue  # Done with this note if it was auto-missed
 
-                # C. Hold Note specific update logic (if head was hit and not yet fully judged)
-                if note.note_type == HOLD_NOTE_BODY and note.is_head_hit_successfully and not note.is_judged:
-                    # Check for broken hold if player released key prematurely
-                    if note.is_holding and (note.lane not in self.keys_currently_pressed_lanes):
-                        if game_time < note.end_time - self.od_judgement_windows_s[
-                            'MEH']:  # Released before tail MEH window even starts
-                            note.broken_hold = True
-                        note.is_holding = False
-                        print(f"Lane {note.lane} HOLD BROKEN (key release detected in update) at {game_time:.3f}s")
+            # D. Hold Note specific update logic (if head was successfully hit and not yet fully judged)
+            if note.note_type == HOLD_NOTE_BODY and note.is_head_hit_successfully and not note.is_judged:
+                # Check for broken hold
+                if note.is_holding and (note.lane not in self.keys_currently_pressed_lanes):
+                    # Check if break happened before tail's MEH window (grace period for tail)
+                    if game_time < note.end_time - self.od_judgement_windows_s['MEH']:
+                        note.broken_hold = True
+                    note.is_holding = False
+                    print(f"Lane {note.lane} HOLD BROKEN (key release detected) at {game_time:.3f}s (Tail end: {note.end_time:.3f})")
 
-                    # Auto-judge hold note tail if time has passed significantly
-                    if game_time > note.end_time + self.auto_miss_if_unhit_offset_s:  # Past tail's OK window
-                        if not note.is_judged:  # If not already judged by an explicit release
-                            print(f"Lane {note.lane} HOLD TAIL auto-judging past OK window at {game_time:.3f}s")
+                # Auto-judge hold note tail if time has passed its OK window
+                if game_time > note.end_time + self.auto_miss_if_unhit_offset_s:
+                    if not note.is_judged:  # Check again, explicit release might have happened
+                        print(f"Lane {note.lane} HOLD TAIL auto-judging past OK window at {game_time:.3f}s")
 
-                            is_key_pressed_for_tail_end = (note.lane in self.keys_currently_pressed_lanes and
-                                                           game_time >= note.end_time + self.no_effect_early_press_offset_s and  # From start of tail MISS_HIT_BOUNDARY
-                                                           game_time <= note.end_time + self.auto_miss_if_unhit_offset_s)  # To end of tail OK window
+                        # Determine if key was held through the relevant part of the tail
+                        # Rule: "MISS: Not having the key pressed from the tail's early MEH window start to late OK window end"
+                        # This is complex. Simplified check:
+                        is_key_effectively_held_for_tail = note.lane in self.keys_currently_pressed_lanes and \
+                                                           game_time <= note.end_time + self.auto_miss_if_unhit_offset_s
 
-                            if note.broken_hold or not is_key_pressed_for_tail_end:
-                                note.tail_release_error = self.od_judgement_windows_s['MISS'] + 0.001  # Penalize
-                            else:  # Still holding properly through the tail's OK window
-                                note.tail_release_error = 0.0  # Assume perfect release if held through
+                        if note.broken_hold or not is_key_effectively_held_for_tail:
+                            note.tail_release_error = self.od_judgement_windows_s['MISS'] + 0.001  # Penalize
+                        else:  # Assumed held correctly if not broken and key still down during this auto-judge period
+                            note.tail_release_error = 0.0  # Ideal release if held through
 
-                            self._judge_completed_hold_note(note)
-                            continue  # Judged
+                        self._judge_completed_hold_note(note)
 
         # 3. Clean up judged notes from the main active_notes deque
         self.active_notes = deque(note for note in self.active_notes if not note.is_judged)
@@ -645,12 +603,10 @@ class ManiaGame(AsyncTkHelper):
         await asyncio.sleep(duration)
         # Check if canvas and text_item still exist before deleting
         if self.canvas and not self.destroyed:
-            try:
-                # Check if item is still valid; find_all might be safer if tags are used
-                if text_item in self.canvas.find_withtag("judgement_text"):
-                    self.canvas.delete(text_item)
-            except tk.TclError:
-                pass  # Widget might have been destroyed
+            # Check if item is still valid; find_all might be safer if tags are used
+            if text_item in self.canvas.find_withtag("judgement_text"):
+                self.canvas.delete(text_item)
+
 
     def _display_judgement_text(self, text: str, lane: int, duration: float = 0.5, color: Optional[str] = None):
         # ... (your existing display logic is good, just ensure canvas checks if used in async coro)
