@@ -97,7 +97,7 @@ class GameNote:
 
     def draw_on_canvas(self, game_time: float):
         """
-        Creates the canvas item if it's time for it to be visible and it hasn't been drawn/judged.
+        Creates the canvas item if it's time for it to be visible and it hasn't been drawn or judged.
         Assumes self.canvas has been set by ManiaGame.
         """
         if self.is_judged or self.canvas_item_id or not self.canvas:
@@ -106,11 +106,11 @@ class GameNote:
         if bounds := self._get_padded_drawing_bounds(game_time):
             x1_pad, y1_draw, x2_pad, y2_draw = bounds
         else:
-            return
+            return  # Should not happen if canvas is set and initialized
         canvas_height = self.canvas.winfo_height()
 
         # Condition for initial drawing: if any part of the note is within screen bounds
-        is_vertically_visible = (y2_draw > 0 and y1_draw < canvas_height)
+        is_vertically_visible = y2_draw > 0 and y1_draw < canvas_height
 
         if is_vertically_visible:
             self._time_at_last_visual_update = game_time  # Anchor time for first draw
@@ -122,12 +122,12 @@ class GameNote:
 
     def update_visual_position(self, game_time: float):
         """
-        Moves an existing canvas item. If it moves completely off-screen (bottom),
-        its canvas item is deleted. The note object itself persists for time-based judgment.
+        Moves an existing canvas item. It no longer deletes the item if it scrolls off-screen.
+        Deletion is handled only upon final judgment.
         """
         if self.is_judged or not self.canvas_item_id or not self.canvas or not self.canvas.winfo_exists():
-            # If judged, remove_from_canvas would be called by the judging method.
-            # If no canvas_item_id, nothing to move.
+            # If judged, _finalize_judgement should have called remove_from_canvas.
+            # If no canvas_item_id, nothing to move (draw_on_canvas should handle first appearance).
             return
 
         time_elapsed = game_time - self._time_at_last_visual_update
@@ -261,7 +261,6 @@ class ManiaGame(AsyncTkHelper):
         self._create_notes()  # Uses self.note_factory or directly GameNote
 
         self.game_start_time = 0.0
-        self.current_game_time = 0.0
         self.keys_currently_pressed_lanes: set[int] = set()  # Tracks active key presses by lane index
 
         self._setup_input_bindings()
@@ -337,20 +336,22 @@ class ManiaGame(AsyncTkHelper):
             self.root.bind(f"<KeyRelease-{key_char}>", self._on_key_release_event)
 
     def _on_key_press_event(self, event):
+        press_time = self.current_game_time()
         if self.game_start_time == 0:
             return
         lane = self.key_bindings.get(event.keysym)
         if lane is not None and lane not in self.keys_currently_pressed_lanes:  # Process only new presses
             self.keys_currently_pressed_lanes.add(lane)
-            self._process_press(lane, self.current_game_time)
+            self._process_press(lane, press_time)
 
     def _on_key_release_event(self, event):
+        release_time = self.current_game_time()
         if self.game_start_time == 0:
             return
         lane = self.key_bindings.get(event.keysym)
         if lane is not None and lane in self.keys_currently_pressed_lanes:
             self.keys_currently_pressed_lanes.remove(lane)
-            self._process_release(lane, self.current_game_time)
+            self._process_release(lane, release_time)
 
     def _create_notes(self):
         lane_count = self.canvas.lane_count
@@ -607,7 +608,6 @@ class ManiaGame(AsyncTkHelper):
             if text_item in self.canvas.find_withtag("judgement_text"):
                 self.canvas.delete(text_item)
 
-
     def _display_judgement_text(self, text: str, lane: int, duration: float = 0.5, color: Optional[str] = None):
         # ... (your existing display logic is good, just ensure canvas checks if used in async coro)
         if not self.canvas or not self.canvas.winfo_exists():
@@ -646,12 +646,14 @@ class ManiaGame(AsyncTkHelper):
         self.game_start_time = time.perf_counter() + PREPARATION_TIME  # Start time of the song
 
         while not self.destroyed:
-            self.current_game_time = time.perf_counter() - self.game_start_time
-            print(f"Current game time: {self.current_game_time:.3f} seconds")
-            self.update_notes(self.current_game_time)
-            await asyncio.sleep(1 / 240)  # High update rate for logic
+            print(f"Current game time: {self.current_game_time():.3f} seconds")
+            self.update_notes(self.current_game_time())
+            await asyncio.sleep(1 / 480)  # High update rate for logic
 
-    async def main_loop(self, refresh=1 / 120):  # Default refresh for Tkinter if needed
+    def current_game_time(self):
+        return time.perf_counter() - self.game_start_time if self.game_start_time else 0.0
+
+    async def main_loop(self, refresh=1 / 480):  # Default refresh for Tkinter if needed
         # This ensures game_task is created after the event loop starts and before tkinter loop runs.
         if not self.game_task or self.game_task.done():
             self.game_task = asyncio.create_task(self.game_loop())
