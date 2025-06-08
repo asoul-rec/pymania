@@ -1,6 +1,4 @@
 import asyncio
-import threading
-# import tkinter
 from tkinter import Tk, Event, Canvas
 from types import SimpleNamespace
 
@@ -11,6 +9,7 @@ class AsyncTkHelper:
     destroyed = False
     root: Tk = None
     canvas: Canvas = None
+    _tk_update_interval = 1 / 30  # seconds
 
     def run(self):
         asyncio.run(self.main_loop())
@@ -36,11 +35,11 @@ class AsyncTkHelper:
             else:
                 self.canvas.create_rectangle(0, 0, 500, 500, fill="", outline="", tags="__invisible")
 
-    async def main_loop(self, refresh=1 / 60):
+    async def main_loop(self):
         self.loop = asyncio.get_running_loop()
         while not self.destroyed:
             self.update()
-            await asyncio.sleep(refresh)
+            await asyncio.sleep(self._tk_update_interval)
 
     @property
     def is_running(self):

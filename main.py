@@ -9,7 +9,7 @@ from mymania import AsyncTkHelper, parse_osu_beatmap
 # --- Configuration ---
 WINDOW_WIDTH = 500
 WINDOW_HEIGHT = 700
-NOTE_SPEED = 800  # Pixels per second
+NOTE_SPEED = 1200  # Pixels per second
 # FPS = 60
 # UPDATE_DELAY_MS = int(1000 / FPS)
 
@@ -39,7 +39,7 @@ MISS_WINDOW_LATE = JUDGEMENT_WINDOWS["Miss"]
 MISS_WINDOW_EARLY_PENALTY = 0.188  # How early a press is definitively not for the current note.
 
 # Game configs
-PREPARATION_TIME = 3  # Seconds before the game starts moving notes
+PREPARATION_TIME = 2
 
 
 class GameNote:
@@ -644,20 +644,22 @@ class ManiaGame(AsyncTkHelper):
         # Note should appear at the top before the song starts,
         # so we add a preparation time for both the game and the player.
         self.game_start_time = time.perf_counter() + PREPARATION_TIME  # Start time of the song
+        self._tk_update_interval = 0.  # fast refresh in game
 
         while not self.destroyed:
             print(f"Current game time: {self.current_game_time():.3f} seconds")
             self.update_notes(self.current_game_time())
             await asyncio.sleep(1 / 480)  # High update rate for logic
+        del self._tk_update_interval
 
     def current_game_time(self):
         return time.perf_counter() - self.game_start_time if self.game_start_time else 0.0
 
-    async def main_loop(self, refresh=1 / 480):  # Default refresh for Tkinter if needed
+    async def main_loop(self):  # Default refresh for Tkinter if needed
         # This ensures game_task is created after the event loop starts and before tkinter loop runs.
         if not self.game_task or self.game_task.done():
             self.game_task = asyncio.create_task(self.game_loop())
-        await super().main_loop(refresh)
+        await super().main_loop()
 
 
 if __name__ == '__main__':
