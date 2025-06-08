@@ -296,9 +296,11 @@ class AudioFile:
             if raw_frame is None:  # EOF reached, the returned self.close task will clean up
                 if self._resampler is not None:
                     for frame in self._resampler.resample(None):
+                        frame.pts = None
                         self._fifo.write(frame)
                 break
             for frame in [raw_frame] if self._resampler is None else self._resampler.resample(raw_frame):
+                frame.pts = None
                 self._fifo.write(frame)
 
             if self._enough_samples_num:  # feed hungry readers

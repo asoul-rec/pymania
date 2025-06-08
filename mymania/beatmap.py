@@ -1,3 +1,7 @@
+from pathlib import Path
+from typing import Union
+
+
 def parse_osu_beatmap(beatmap_path: str) -> dict:
     """
     Parse an osu! beatmap file and return its metadata.
@@ -92,3 +96,20 @@ def parse_osu_beatmap(beatmap_path: str) -> dict:
                     content.append(line.split(','))
         data[section] = content  # Add the last section
     return data
+
+
+def scan_dir(path: Union[str, Path]) -> dict:
+    """
+    Scan a directory for osu! beatmap files
+
+    :param path: Path to the directory containing beatmap files.
+    :return: A dictionary mapping beatmap file names to their metadata.
+    """
+    beatmap = {}
+    for map_dir in Path(path).iterdir():
+        if not map_dir.is_dir():
+            continue
+        beatmap[map_dir.name] = [
+            m for m in map_dir.iterdir() if m.is_file() and m.suffix == '.osu'
+        ]
+    return beatmap

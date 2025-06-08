@@ -1,10 +1,20 @@
 import time
 import tkinter as tk
 import asyncio
+from pathlib import Path
+from tkinter import ttk
 from typing import Optional
 from collections import deque
+import logging
 
-from mymania import AsyncTkHelper, parse_osu_beatmap
+# import os
+# os.environ["SD_ENABLE_ASIO"] = "1"
+logging.basicConfig(level=logging.DEBUG)
+
+import av
+from mymania import AsyncTkHelper, parse_osu_beatmap, AudioPlayer
+from mymania.audio import AudioFile
+from mymania.beatmap import scan_dir
 
 # --- Configuration ---
 WINDOW_WIDTH = 500
@@ -39,14 +49,17 @@ MISS_WINDOW_LATE = JUDGEMENT_WINDOWS["Miss"]
 MISS_WINDOW_EARLY_PENALTY = 0.188  # How early a press is definitively not for the current note.
 
 # Game configs
-PREPARATION_TIME = 2
+PREPARATION_TIME = 2  # Seconds before the game starts moving notes
+
+sfx_data = [None] * 4
 
 
 class GameNote:
-    def __init__(self, lane, note_type, hit_time, end_time=None):
+    def __init__(self, lane, note_type, hit_time, hit_sound, end_time=None):
         self.lane = lane
         self.note_type = note_type
         self.hit_time = hit_time
+        self.hit_sound = hit_sound
         self.end_time = end_time
 
         # Visual
@@ -69,6 +82,11 @@ class GameNote:
         self.is_holding = False
         self.is_head_hit_successfully = False
         self.broken_hold = False
+        self.sfx = []
+
+        for i in range(4):
+            if hit_sound | (1 << i):
+                self.sfx.append(i)
 
     def get_x_coords(self) -> Optional[tuple[float, float]]:
         if self.canvas is not None and (lane_width := self.canvas.lane_width) is not None:
@@ -161,30 +179,29 @@ class GameNote:
 
     # _finalize_judgement, judge_tap_hit, judge_hold_head_hit, etc.
     # These methods should call self.remove_from_canvas() when a note is definitively judged.
-    def _finalize_judgement(self, judgement: str):  # Make sure this is called by all judging paths
+    def _finalize_judgement(self, judgement: str,
+                            time_difference: float = None):  # Make sure this is called by all judging paths
         if self.is_judged: return  # Avoid double judgement
         self.is_judged = True
         self.judgement_result = judgement
         print(f"Lane {self.lane} ({self.note_type}): {self.judgement_result}! (Hit: {self.hit_time:.3f}" +
+              (f", Diff: {time_difference:.3f}" if time_difference is not None else "") +
               (f", End: {self.end_time:.3f}" if self.end_time else "") + ")")
         self.remove_from_canvas()  # Crucial: remove visual when judged
 
     # Ensure judge_as_miss also calls _finalize_judgement or directly remove_from_canvas
     def judge_as_miss(self):
-        if self.is_judged: return
-        # self.is_missed = True # This was from previous structure, now covered by is_judged + judgement_result
-        # self.is_hit = True    # "
-        # self.judgement_result = "Miss"
-        # print(f"Lane {self.lane}: MISS! (Time: {self.hit_time:.3f})")
-        # self.remove_from_canvas()
+        if self.is_judged:
+            return
         self._finalize_judgement("Miss")
 
     # Other judgement methods (judge_tap_hit, judge_hold_head_hit, judge_hold_complete)
     # should ultimately lead to _finalize_judgement or set self.is_judged and call remove_from_canvas.
     # For example:
-    def judge_tap_hit(self, judgement: str):
-        if self.is_judged: return
-        self._finalize_judgement(judgement)
+    def judge_tap_hit(self, judgement: str, time_difference: float):
+        if self.is_judged:
+            return
+        self._finalize_judgement(judgement, time_difference)
 
     def judge_hold_head_hit(self, head_error_abs: float, head_judgement: str):
         if self.is_judged or self.is_head_hit_successfully:
@@ -198,7 +215,8 @@ class GameNote:
             self._finalize_judgement("Miss")
 
     def judge_hold_complete(self, final_judgement: str):
-        if self.is_judged: return
+        if self.is_judged:
+            return
         self._finalize_judgement(final_judgement)
 
 
@@ -213,16 +231,15 @@ class GameCanvas(tk.Canvas):
 
     def draw_judgment_line(self, y_pos):
         self.judgment_line_y = self.winfo_height() - y_pos
-
         self.create_line(
             0, self.judgment_line_y,
             WINDOW_WIDTH, self.judgment_line_y,
             fill=JUDGMENT_LINE_COLOR, width=3, tags="judgment_line"
         )
-        self.create_text(
-            WINDOW_WIDTH - 40, self.judgment_line_y - 15,
-            text="JUDGE HERE", fill=JUDGMENT_LINE_COLOR, font=("Arial", 8)
-        )
+        # self.create_text(
+        #     WINDOW_WIDTH - 40, self.judgment_line_y - 15,
+        #     text="JUDGE HERE", fill=JUDGMENT_LINE_COLOR, font=("Arial", 8)
+        # )
 
     def draw_lanes(self):
         for i in range(1, self.lane_count):
@@ -231,6 +248,9 @@ class GameCanvas(tk.Canvas):
 
 
 class ManiaGame(AsyncTkHelper):
+    canvas: GameCanvas
+    audio_player: Optional[AudioPlayer] = None
+
     def __init__(self, root, beatmap_path):
         self.root = root
         self.root.title("Minimal Mania")
@@ -246,6 +266,7 @@ class ManiaGame(AsyncTkHelper):
         self._calculate_od_windows()  # New method to set self.od_judgement_windows_s etc.
 
         self.lane_count = round(self.beatmap_data['Difficulty']['CircleSize'])
+        self.song_file = Path(beatmap_path).parent / self.beatmap_data['General']['AudioFilename']
         self.key_bindings = self._get_default_key_bindings(self.lane_count)
 
         self.canvas = GameCanvas(root, width=WINDOW_WIDTH, height=WINDOW_HEIGHT, bg=LANE_COLOR)
@@ -260,8 +281,9 @@ class ManiaGame(AsyncTkHelper):
         self.active_notes: deque[GameNote] = deque()
         self._create_notes()  # Uses self.note_factory or directly GameNote
 
-        self.game_start_time = 0.0
+        self.game_start_time = None
         self.keys_currently_pressed_lanes: set[int] = set()  # Tracks active key presses by lane index
+        self.audio_offset = 0.03
 
         self._setup_input_bindings()
         self.judgement_display_tasks = []
@@ -336,15 +358,20 @@ class ManiaGame(AsyncTkHelper):
             self.root.bind(f"<KeyRelease-{key_char}>", self._on_key_release_event)
 
     def _on_key_press_event(self, event):
+        if self.game_task is None or self.game_task.done():
+            return
         press_time = self.current_game_time()
         if self.game_start_time == 0:
             return
         lane = self.key_bindings.get(event.keysym)
         if lane is not None and lane not in self.keys_currently_pressed_lanes:  # Process only new presses
+            self.audio_player.play_sound_effect(sfx_data[0])
             self.keys_currently_pressed_lanes.add(lane)
             self._process_press(lane, press_time)
 
     def _on_key_release_event(self, event):
+        if self.game_task is None or self.game_task.done():
+            return
         release_time = self.current_game_time()
         if self.game_start_time == 0:
             return
@@ -375,7 +402,9 @@ class ManiaGame(AsyncTkHelper):
             else:
                 continue
 
-            all_notes.append(GameNote(lane=lane, note_type=note_type, hit_time=hit_time, end_time=end_time))
+            all_notes.append(GameNote(
+                lane=lane, note_type=note_type, hit_time=hit_time, end_time=end_time, hit_sound=int(obj[4])
+            ))
 
         all_notes.sort(key=lambda note: note.hit_time, reverse=True)
         self.pending_notes = all_notes
@@ -425,7 +454,7 @@ class ManiaGame(AsyncTkHelper):
             # Else, it remains "Miss" (as it's within MISS_HIT_BOUNDARY but > MEH)
 
             if note.note_type == TAP_NOTE:
-                note.judge_tap_hit(press_judgement)
+                note.judge_tap_hit(press_judgement, time_difference)
                 self._display_judgement_text(note.judgement_result, note.lane)
             elif note.note_type == HOLD_NOTE_BODY:
                 # For hold notes, this press is for the head.
@@ -534,7 +563,7 @@ class ManiaGame(AsyncTkHelper):
         while self.pending_notes:
             if self.pending_notes[-1].hit_time <= game_time + self.NOTE_ACTIVATION_LEAD_TIME_S:
                 note = self.pending_notes.pop()
-                note.canvas = self.canvas # Set canvas reference immediately
+                note.canvas = self.canvas  # Set canvas reference immediately
                 self.active_notes.append(note)
             else:
                 break  # Earliest pending note is still too far in the future.
@@ -577,7 +606,8 @@ class ManiaGame(AsyncTkHelper):
                     if game_time < note.end_time - self.od_judgement_windows_s['MEH']:
                         note.broken_hold = True
                     note.is_holding = False
-                    print(f"Lane {note.lane} HOLD BROKEN (key release detected) at {game_time:.3f}s (Tail end: {note.end_time:.3f})")
+                    print(
+                        f"Lane {note.lane} HOLD BROKEN (key release detected) at {game_time:.3f}s (Tail end: {note.end_time:.3f})")
 
                 # Auto-judge hold note tail if time has passed its OK window
                 if game_time > note.end_time + self.auto_miss_if_unhit_offset_s:
@@ -645,27 +675,69 @@ class ManiaGame(AsyncTkHelper):
         # so we add a preparation time for both the game and the player.
         self.game_start_time = time.perf_counter() + PREPARATION_TIME  # Start time of the song
         self._tk_update_interval = 0.  # fast refresh in game
+        import sounddevice as sd
+        print(sd.query_devices())
+        print(sd.query_hostapis())
+        for i in sd.query_hostapis():
+            if 'wdm' in i['name'].lower():
+                device = i['default_output_device']
+                # device = 20
+                print(i)
+                print(sd.query_devices(device))
+                break
+        else:
+            raise RuntimeError("No WASAPI audio output device found.")
+        self.audio_player = AudioPlayer(48000, sample_fmt='s16')
+        self.audio_player.latency = 'low'
+        self.audio_player.start_stream(device=device)
+        # self.audio_player.start_stream(device=device, extra_settings=sd.WasapiSettings(exclusive=True))
+        await self.audio_player.load_song(str(self.song_file), False)
+        af = AudioFile("drum-hitnormal.wav")
+        await af.open(resampler=av.AudioResampler('fltp', 'stereo', 48000))
+        sfx_data[:] = [await af.read(100_000)] * 4
 
+        assert self.current_game_time() < 0, "Not ready after preparation"  # Ensure we are in the preparation phase
+        song_started = False
         while not self.destroyed:
-            print(f"Current game time: {self.current_game_time():.3f} seconds")
+            if not self.audio_player.is_playing_song:
+                if song_started:  # TODO: add pause feature
+                    logging.info(f"Song has ended at {self.current_game_time():.3f} seconds, stopping game loop.")
+                    break
+                if self.current_game_time() >= 0:
+                    self.audio_player.resume_song()
+                    song_started = True
+            else:  # sync visual and judgment time with audio
+                if (song_start_time := self.audio_player.song_start_time) is not None:
+                    song_start_time += self.audio_offset
+                    if abs(song_start_time - self.game_start_time) > 1e-3:
+                        print(f"Current game time: {self.current_game_time():.3f} seconds, adjust {song_start_time - self.game_start_time}", flush=True)
+                        print(song_start_time)
+                        self.game_start_time = song_start_time  # Adjust game start time if audio is delayed
             self.update_notes(self.current_game_time())
-            await asyncio.sleep(1 / 480)  # High update rate for logic
+            await asyncio.sleep(1 / 120)
+        await self.audio_player.stop_stream()
+        self.audio_player = self.game_start_time = None
         del self._tk_update_interval
 
     def current_game_time(self):
-        return time.perf_counter() - self.game_start_time if self.game_start_time else 0.0
+        return 0. if self.game_start_time is None else time.perf_counter() - self.game_start_time
 
-    async def main_loop(self):  # Default refresh for Tkinter if needed
-        # This ensures game_task is created after the event loop starts and before tkinter loop runs.
-        if not self.game_task or self.game_task.done():
-            self.game_task = asyncio.create_task(self.game_loop())
-        await super().main_loop()
+    async def main_loop(self):
+        try:
+            if not self.game_task or self.game_task.done():
+                self.game_task = asyncio.create_task(self.game_loop())
+            await super().main_loop()
+            await self.game_task
+        except asyncio.CancelledError:
+            await self.audio_player.stop_stream()
 
 
 if __name__ == '__main__':
     root = tk.Tk()
-    beatmap1 = "571547 Gom (HoneyWorks) - Zen Zen Zense/Gom (HoneyWorks) - Zen Zen Zense (Antalf) [Kaito's 7K Hard].osu"
-    beatmap2 = "146875 Nanamori-chu _ Goraku-bu - Yuriyurarararayuruyuri Daijiken (TV Size)/Nanamori-chu  Goraku-bu - Yuriyurarararayuruyuri Daijiken (TV Size) (Lokovodo) [EZ].osu"
-
-    game = ManiaGame(root, beatmap2)
-    game.run()
+    beatmaps = scan_dir("Songs")
+    game = ManiaGame(root, list(beatmaps.items())[0][1][0])
+    try:
+        game.run()
+    except KeyboardInterrupt:
+        logging.warning("Game interrupted by user. Exiting.")
+    logging.debug("event loop ends")
