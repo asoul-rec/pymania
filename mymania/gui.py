@@ -1,7 +1,7 @@
 import asyncio
 import threading
 # import tkinter
-from tkinter import Tk, Event
+from tkinter import Tk, Event, Canvas
 from types import SimpleNamespace
 
 
@@ -10,6 +10,7 @@ class AsyncTkHelper:
     loop: asyncio.AbstractEventLoop = None
     destroyed = False
     root: Tk = None
+    canvas: Canvas = None
 
     def run(self):
         asyncio.run(self.main_loop())
@@ -24,7 +25,16 @@ class AsyncTkHelper:
         root.bind('<Destroy>', _destroy)
 
     def update(self):
+        self._invisible_refresh()
         self.root.update()
+
+    def _invisible_refresh(self):
+        if self.canvas is not None:
+            if coords := self.canvas.coords("__invisible"):
+                move = 300 if coords[3] < 200 else -1
+                self.canvas.move("__invisible", 0, move)
+            else:
+                self.canvas.create_rectangle(0, 0, 500, 500, fill="", outline="", tags="__invisible")
 
     async def main_loop(self, refresh=1 / 60):
         self.loop = asyncio.get_running_loop()
