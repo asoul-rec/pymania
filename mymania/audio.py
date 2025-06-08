@@ -29,6 +29,9 @@ class AudioPlayer:
     zero_val: Real
     _pa_ts_offset: Optional[float] = None  # Portable Audio Timestamp Offset comparing with time.perf_counter()
     song_start_time: Optional[float] = None  # Start time of the song in the stream's time base
+    real_latency: Optional[float] = None  # Real latency of the stream, set after starting the stream
+    _device_info: Optional[dict] = None  # Device info from sounddevice
+    _hostapi: Optional[str] = None  # Host API name from sounddevice
 
     def __init__(self, sample_rate: int, *, channels: int = 2, sample_fmt: str = 's16', latency='low'):
         self.sample_rate = sample_rate
@@ -67,15 +70,18 @@ class AudioPlayer:
         return sample
 
     def _audio_callback(self, outdata, samples: int, time_info, status):
+        if self._hostapi == "Windows WDM-KS":
+            playback_time = time_info.currentTime  # fix for Windows WDM-KS: OutputBufferDacTime is not absolute
+        else:
+            playback_time = time_info.outputBufferDacTime
         if self._pa_ts_offset is None:
             # Calculate the offset once when the callback is first invoked
-            _pa_ts_offset = time.perf_counter() - time_info.currentTime
+            _pa_ts_offset = time.perf_counter() - playback_time
             if 0 <= _pa_ts_offset < 0.001:
                 self._pa_ts_offset = 0
             else:
                 self._pa_ts_offset = _pa_ts_offset
-            time.sleep(0.001)
-            print("PA Timestamp Offset:", self._pa_ts_offset)
+            print("PA Timestamp Offset:", self._pa_ts_offset, playback_time)
         if status:
             print("Audio Callback Status:", status, flush=True)
 
@@ -90,11 +96,12 @@ class AudioPlayer:
             if self.song is not None:
                 song_data = None
                 if self.is_playing_song:
-                    # This may crash when exiting. Why?
                     # try:
                     #     _read_future = self.song.read_thread_safe(samples)
-                    #     song_data = _read_future.result(timeout=self._stream.latency * 0.5)
-                    # except (TimeoutError, concurrent.futures.CancelledError, RuntimeError):
+                    #     song_data = _read_future.result(timeout=samples / self.sample_rate * 0.8)
+                    # except TimeoutError:
+                    #     logging.warning("Timeout while reading song data, continuing with silence.")
+                    # except (concurrent.futures.CancelledError, RuntimeError):
                     #     pass
                     song_data = self.song.read_nowait(samples)
                 if song_data is None:
@@ -102,11 +109,11 @@ class AudioPlayer:
                         self.is_playing_song = False
                 else:
                     if (pts := self.song.last_read_pts) is not None:
-                        self.song_start_time = time_info.currentTime + self._pa_ts_offset - pts
+                        self.song_start_time = playback_time + self._pa_ts_offset - pts
                     else:
                         self.song_start_time = None
                     # t = time.perf_counter() - self._pa_ts_offset
-                    # print(f"Output dt {time_info.outputBufferDacTime - t:.6f}, "
+                    # print(f"dac time, {time_info.outputBufferDacTime:.6f}, current time {time_info.currentTime:.6f}, "
                     #       f"{float(self.song.last_read_pts):.3f}, start {self.song_start_time}", flush=True)
                     for i, sample_value in enumerate(song_data):
                         outdata_view[i] = sample_value // 2
@@ -160,34 +167,13 @@ class AudioPlayer:
                         if (sfx_pos_frames_o + frames_to_read_sfx_o) >= sfx_total_frames_o:
                             sfx_to_remove_from_deque.append(other_sfx_item)
 
-            # Remove finished SFX (deque remove is O(N), consider if this is too slow for many SFX)
-            # This removal logic needs to be robust if items are not unique or if order changes.
-            # A simpler way for deque is to pop from left if oldest is done, but here we might remove from middle.
-            # For now, let's rebuild the deque without the finished ones if removal is complex.
             if sfx_to_remove_from_deque:
-                new_active_sfx = deque()
-                for item in self._active_sfx:
-                    is_finished = False
-                    # Check if item is in the list of items to remove (by identity or content)
-                    # This simple check by identity might fail if tuples are regenerated.
-                    # A more robust way would be to mark them with a flag or use indices carefully.
-                    # For now, assuming items are unique enough or this needs refinement.
-                    if item in sfx_to_remove_from_deque:  # This check might be problematic
-                        is_finished = True
+                # Create a set of trigger times for fast O(1) lookups
+                finished_sfx_times = {item[2] for item in sfx_to_remove_from_deque}
 
-                    # A better way if items are identified by (e.g.) trigger_time or a unique ID:
-                    # finished_trigger_times = {s[2] for s in sfx_to_remove_from_deque}
-                    # if item[2] in finished_trigger_times:
-                    #    is_finished = True
-
-                    # Simplest robust (but perhaps not most performant) way to remove:
-                temp_list = list(self._active_sfx)
-                for item_to_remove in sfx_to_remove_from_deque:
-                    try:
-                        temp_list.remove(item_to_remove)  # Relies on tuple equality
-                    except ValueError:
-                        pass  # Item already removed or not found
-                self._active_sfx = deque(temp_list)
+                # Rebuild the deque by filtering out the finished SFX.
+                # This is generally safer and clearer than removing from a list in a loop.
+                self._active_sfx = deque(item for item in self._active_sfx if item[2] not in finished_sfx_times)
 
         # Add accumulated float SFX mix to the main mix_buffer_array
         # This assumes mix_buffer_array is of the target type (e.g. float32 or int16)
@@ -214,14 +200,17 @@ class AudioPlayer:
             }
             stream_kwargs.update(kwargs)
             self._stream = sd.RawOutputStream(**stream_kwargs)
+            self.real_latency = self._stream.latency  # Store the real latency for reference
+            device_info = self._device_info = sd.query_devices(self._stream.device)
+            self._hostapi = sd.query_hostapis()[device_info['hostapi']]['name']
+            print("Audio stream will start, real latency:", self.real_latency)
             self._stream.start()
-            print("Audio stream started, latency:", self._stream.latency)
         except Exception as e:
             print(f"Error starting audio stream: {e}", flush=True)
             self._stream = None
 
     async def stop_stream(self):
-        await self.song.close(flush=True)
+        await self.song.close()
         if self._stream is not None and self._stream.active:
             with self._song_reading_lock, self._sfx_lock:
                 self.is_playing_song = False
@@ -269,14 +258,12 @@ class AudioFile:
         self._read_lock = asyncio.Lock()  # Lock for read operations
         self._eof = False  # End of file flag
         self._buffer_time = buffer_time  # Buffer time in seconds
-        self._container_busy = asyncio.Lock()  # Lock for container operations
 
     async def open(self, *args, resampler: av.AudioResampler = None, **kwargs):
         await self.close()  # Close any existing container before opening a new one
         self._resampler = resampler
         self._loop = asyncio.get_event_loop()
-        async with self._container_busy:
-            self.container = await asyncio.to_thread(av.open, self.file_path, *args, **kwargs)
+        self.container = await asyncio.to_thread(av.open, self.file_path, *args, **kwargs)
         if (audio_stream_number := len(self.container.streams.audio)) != 1:
             raise ValueError(f"{audio_stream_number} audio streams found in {self.file_path}, expected 1.")
         self.audio_stream = self.container.streams.audio[0]
@@ -287,31 +274,41 @@ class AudioFile:
         self._read_task = asyncio.create_task(self._fill_fifo())
 
     async def _fill_fifo(self):
-        async with self._container_busy:
-            _iter = await asyncio.to_thread(self.container.decode, self.audio_stream)
-        while True:
-            async with self._container_busy:
-                raw_frame = await asyncio.to_thread(next, _iter, None)  # default to None and avoid StopIteration
+        try:
+            _thread_task = asyncio.create_task(asyncio.to_thread(self.container.decode, self.audio_stream))
+            _iter = await asyncio.shield(_thread_task)
+            while True:
+                # default to None to avoid StopIteration raised in coroutine
+                _thread_task = asyncio.create_task(asyncio.to_thread(next, _iter, None))
+                raw_frame = await asyncio.shield(_thread_task)
 
-            if raw_frame is None:  # EOF reached, the returned self.close task will clean up
-                if self._resampler is not None:
-                    for frame in self._resampler.resample(None):
-                        frame.pts = None
-                        self._fifo.write(frame)
-                break
-            for frame in [raw_frame] if self._resampler is None else self._resampler.resample(raw_frame):
-                frame.pts = None
-                self._fifo.write(frame)
+                if raw_frame is None:  # EOF reached, the returned self.close task will clean up
+                    if self._resampler is not None:
+                        for frame in self._resampler.resample(None):
+                            frame.pts = None
+                            self._fifo.write(frame)
+                    break
+                for frame in [raw_frame] if self._resampler is None else self._resampler.resample(raw_frame):
+                    frame.pts = None
+                    self._fifo.write(frame)
 
-            if self._enough_samples_num:  # feed hungry readers
-                if self._fifo.samples >= self._enough_samples_num:
-                    self._enough_samples.set()
-                else:
-                    continue  # read() may want more samples than buffer size
-            while self._fifo.samples >= self._buffer_samples:
-                self._not_full.clear()
-                await self._not_full.wait()
-        return asyncio.create_task(self.close())  # keep a reference to the close task
+                if self._enough_samples_num:  # feed hungry readers
+                    if self._fifo.samples >= self._enough_samples_num:
+                        self._enough_samples.set()
+                    else:
+                        continue  # read() may want more samples than buffer size
+                while self._fifo.samples >= self._buffer_samples:
+                    self._not_full.clear()
+                    await self._not_full.wait()
+        except asyncio.CancelledError:
+            logging.info("_fill_fifo task was cancelled.")
+            if not _thread_task.done():
+                logging.debug("Some file operation was performing during cancellation.")
+                await _thread_task  # critical file operation in another thread, must finish before closing
+            self._fifo.read()
+            raise
+        finally:
+            await self._cleanup()
 
     def _frame_to_array(self, frame: av.AudioFrame) -> Optional[array.array]:
         if frame is None:
@@ -328,7 +325,7 @@ class AudioFile:
     async def read(self, samples: int) -> Optional[array.array]:
         """
         Read a specified number of samples from the audio file.
-        Returned samples may be less than requested if EOF is reached or not enough samples are available.
+        Try to return required number of samples and may be fewer if EOF is reached
         :param samples: Positive integer number of samples to read.
         :return: An AudioFrame containing the read samples.
         """
@@ -342,11 +339,12 @@ class AudioFile:
                 return self._frame_to_array(self._fifo.read(samples))
             if self._eof:
                 return self._frame_to_array(self._fifo.read())
+            logging.debug("Waiting for more samples, current FIFO size: %d, requested: %d", self._fifo.samples, samples)
+            self._enough_samples_num = samples
+            self._enough_samples.clear()
             async with self._read_lock:  # only lock when waiting for more samples
-                self._enough_samples_num = samples
-                self._enough_samples.clear()
                 await self._enough_samples.wait()
-                self._enough_samples_num = 0
+            self._enough_samples_num = 0
         raise RuntimeError("Internal error: failed to read samples after an attempt.")
 
     def read_nowait(self, samples: int) -> Optional[array.array]:
@@ -356,21 +354,21 @@ class AudioFile:
             pass
         return self._frame_to_array(self._fifo.read(samples)) if self._fifo.samples >= samples else None
 
-    async def close(self, flush: bool = False):
-        async with self._container_busy:
-            if self._read_task is not None and not self._read_task.done():
-                self._read_task.cancel()
-                await asyncio.gather(self._read_task, return_exceptions=True)  # wait but ignore cancellation
+    async def close(self):
+        logging.info(f"Closing audio file {self.file_path}")
+        if self._read_task is not None and not self._read_task.done():
+            logging.debug(f"trying to cancel the fifo filler")
+            self._read_task.cancel()
+            await asyncio.gather(self._read_task, return_exceptions=True)  # wait but ignore cancellation
+        self._fifo.read()
+        await self._cleanup()
+
+    async def _cleanup(self):
         self._eof = True
         self._enough_samples.set()  # wake up any waiting readers
-        if flush:
-            self._fifo.read()
         if self.container is not None:
-            try:
-                async with self._container_busy:
-                    await asyncio.to_thread(self.container.close)
-            finally:
-                self.container = self.audio_stream = None
+            await asyncio.to_thread(self.container.close)
+            self.container = self.audio_stream = None
 
     def read_thread_safe(self, samples: int):
         return asyncio.run_coroutine_threadsafe(self.read(samples), self._loop)
