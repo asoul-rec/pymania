@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Union
 
 
-def parse_osu_beatmap(beatmap_path: str) -> dict:
+def parse_osu_beatmap(beatmap_path: Union[Path, str]) -> dict:
     """
     Parse an osu! beatmap file and return its metadata.
 
